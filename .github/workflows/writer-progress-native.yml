@@ -14,36 +14,59 @@ jobs:
   native:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [1.20.x, 1.21.x, 1.22.x, stable]
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
-          go-version: 1.22.x
+          go-version: ${{ matrix.go }}
           cache: false
-      - name: Record original source
+      - name: Record fixed source
         run: |
           mkdir -p native-proof
           go version
           git rev-parse HEAD | tee native-proof/head-before.txt
-          test "$(git hash-object conn.go)" = 9562ffd4978ccabea0da2f06256e1c281bcefb7f
+          test "$(git hash-object conn.go)" = a8830baa38a7a567e4212d7c982c4924f2b8d1fe
+          test "$(git hash-object writer_count_test.go)" = 79690d893a3319365070a957d3d3a78f385fa91b
           git hash-object conn.go writer_count_test.go | tee native-proof/blobs-before.txt
           sha256sum conn.go writer_count_test.go | tee native-proof/sha256-before.txt
       - name: Download project dependencies
         run: go mod download
-      - name: Existing writer and framing controls
+      - name: Focused native writer regressions
         run: |
           set -o pipefail
-          go test -v -race -run '^(TestFraming|TestWriteAfterMessageWriterClose|TestWriteBufferPool|TestWriteBufferPoolSync|TestWriteBufferPoolError)$' . 2>&1 | tee native-proof/existing-tests.log
-      - name: New progress regressions on unchanged production
+          go test -v -race -run '^(TestMessageWriterProgressOnFlushError|TestFraming|TestWriteAfterMessageWriterClose|TestWriteBufferPool|TestWriteBufferPoolSync|TestWriteBufferPoolError)$' . 2>&1 | tee native-proof/focused-tests.log
+      - name: Complete native race suite and coverage
         run: |
           set -o pipefail
-          go test -v -race -run '^TestMessageWriterProgressOnFlushError$' . 2>&1 | tee native-proof/regression-tests.log
-      - name: Save test format preview
-        if: always()
+          go test -v -race -coverprofile=native-proof/coverage.out ./... 2>&1 | tee native-proof/full-tests.log
+          go tool cover -func=native-proof/coverage.out | tee native-proof/coverage-summary.txt
+      - name: Whole-project go vet
         run: |
-          gofmt -d writer_count_test.go > native-proof/test-format.patch
-          gofmt writer_count_test.go > native-proof/formatted-writer_count_test.go
-      - name: Verify unchanged source after tests
+          set -o pipefail
+          go vet ./... 2>&1 | tee native-proof/vet.log
+      - name: Format changed source
+        run: |
+          test -z "$(gofmt -l conn.go writer_count_test.go)"
+      - name: Native benchmark smoke
+        if: matrix.go == '1.22.x'
+        run: |
+          set -o pipefail
+          go test -run '^$' -bench . -benchtime=1x -benchmem ./... 2>&1 | tee native-proof/benchmarks.log
+      - name: Compare whole-project formatting with original baseline
+        if: matrix.go == 'stable'
+        run: |
+          git worktree add --detach /tmp/gorilla-format-baseline e064f32e3674d9d79a8fd417b5bc06fa5c6cad8f
+          gofmt -d -e . > native-proof/fixed-format.patch
+          (cd /tmp/gorilla-format-baseline && gofmt -d -e .) > native-proof/baseline-format.patch
+          diff -u native-proof/baseline-format.patch native-proof/fixed-format.patch
+          test ! -s native-proof/fixed-format.patch
+      - name: Verify unchanged source after tools
         if: always()
         run: |
           git rev-parse HEAD | tee native-proof/head-after.txt
@@ -56,5 +79,85 @@ jobs:
       - uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: writer-progress-native-proof
+          name: writer-progress-native-go-${{ matrix.go }}
+          path: native-proof
+
+  org-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+      - name: Record quality source
+        run: |
+          mkdir -p native-proof
+          go version
+          git rev-parse HEAD | tee native-proof/head-before.txt
+          test "$(git hash-object conn.go)" = a8830baa38a7a567e4212d7c982c4924f2b8d1fe
+          test "$(git hash-object writer_count_test.go)" = 79690d893a3319365070a957d3d3a78f385fa91b
+          git hash-object conn.go writer_count_test.go | tee native-proof/blobs-before.txt
+          sha256sum conn.go writer_count_test.go | tee native-proof/sha256-before.txt
+          git worktree add --detach /tmp/gorilla-quality-baseline e064f32e3674d9d79a8fd417b5bc06fa5c6cad8f
+          (cd /tmp/gorilla-quality-baseline && git rev-parse HEAD && git hash-object conn.go && sha256sum conn.go) | tee native-proof/baseline-source.txt
+      - name: Install pinned quality tools
+        run: |
+          go install golang.org/x/lint/golint@6edffad5e6160f5949cdefc81710b2706fbcd4f6
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          golangci-lint version
+          gosec -version
+          govulncheck -version
+      - name: Run original and fixed quality commands with raw exits
+        run: |
+          set +e
+          proof_dir="$PWD/native-proof"
+          run_check() {
+            label="$1"
+            shift
+            "$@" 2>&1 | tee "$proof_dir/$label.log"
+            result=${PIPESTATUS[0]}
+            printf '%s\n' "$result" > "$proof_dir/$label.exit"
+          }
+          for tree in baseline fixed; do
+            if [ "$tree" = baseline ]; then
+              cd /tmp/gorilla-quality-baseline
+            else
+              cd "$GITHUB_WORKSPACE"
+            fi
+            run_check "$tree-make-verify" make verify
+            run_check "$tree-make-test" make test
+            run_check "$tree-golint" golint -set_exit_status ./...
+            run_check "$tree-golangci" golangci-lint run --timeout=5m ./...
+            run_check "$tree-gosec" gosec -fmt=json ./...
+            run_check "$tree-govulncheck" govulncheck -json ./...
+          done
+          cd "$GITHUB_WORKSPACE"
+          (cd /tmp/gorilla-quality-baseline && git rev-parse HEAD && git hash-object conn.go && sha256sum conn.go && git diff --exit-code) > native-proof/baseline-source-after.txt
+          diff -u native-proof/baseline-source.txt native-proof/baseline-source-after.txt
+          failure=0
+          for tool in make-verify make-test golint golangci gosec govulncheck; do
+            test "$(cat "native-proof/baseline-$tool.exit")" = "$(cat "native-proof/fixed-$tool.exit")" || failure=1
+            test "$(cat "native-proof/fixed-$tool.exit")" = 0 || failure=1
+          done
+          exit "$failure"
+      - name: Verify unchanged quality source
+        if: always()
+        run: |
+          git rev-parse HEAD | tee native-proof/head-after.txt
+          git hash-object conn.go writer_count_test.go | tee native-proof/blobs-after.txt
+          sha256sum conn.go writer_count_test.go | tee native-proof/sha256-after.txt
+          diff -u native-proof/head-before.txt native-proof/head-after.txt
+          diff -u native-proof/blobs-before.txt native-proof/blobs-after.txt
+          diff -u native-proof/sha256-before.txt native-proof/sha256-after.txt
+          git diff --exit-code
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: writer-progress-org-quality
           path: native-proof
