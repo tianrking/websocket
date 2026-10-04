@@ -1,0 +1,60 @@
+name: Writer progress native validation
+
+on:
+  push:
+    branches:
+      - codex/native-writer-progress-red
+      - codex/native-writer-progress-green
+      - codex/native-writer-progress-final
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.22.x
+          cache: false
+      - name: Record original source
+        run: |
+          mkdir -p native-proof
+          go version
+          git rev-parse HEAD | tee native-proof/head-before.txt
+          test "$(git hash-object conn.go)" = 9562ffd4978ccabea0da2f06256e1c281bcefb7f
+          git hash-object conn.go writer_count_test.go | tee native-proof/blobs-before.txt
+          sha256sum conn.go writer_count_test.go | tee native-proof/sha256-before.txt
+      - name: Download project dependencies
+        run: go mod download
+      - name: Existing writer and framing controls
+        run: |
+          set -o pipefail
+          go test -v -race -run '^(TestFraming|TestWriteAfterMessageWriterClose|TestWriteBufferPool|TestWriteBufferPoolSync|TestWriteBufferPoolError)$' . 2>&1 | tee native-proof/existing-tests.log
+      - name: New progress regressions on unchanged production
+        run: |
+          set -o pipefail
+          go test -v -race -run '^TestMessageWriterProgressOnFlushError$' . 2>&1 | tee native-proof/regression-tests.log
+      - name: Save test format preview
+        if: always()
+        run: |
+          gofmt -d writer_count_test.go > native-proof/test-format.patch
+          gofmt writer_count_test.go > native-proof/formatted-writer_count_test.go
+      - name: Verify unchanged source after tests
+        if: always()
+        run: |
+          git rev-parse HEAD | tee native-proof/head-after.txt
+          git hash-object conn.go writer_count_test.go | tee native-proof/blobs-after.txt
+          sha256sum conn.go writer_count_test.go | tee native-proof/sha256-after.txt
+          diff -u native-proof/head-before.txt native-proof/head-after.txt
+          diff -u native-proof/blobs-before.txt native-proof/blobs-after.txt
+          diff -u native-proof/sha256-before.txt native-proof/sha256-after.txt
+          git diff --exit-code
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: writer-progress-native-proof
+          path: native-proof
