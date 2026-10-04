@@ -5,6 +5,7 @@
 package websocket
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -19,7 +20,7 @@ import (
 type writeCountFailConn struct {
 	net.Conn
 	remaining int
-	err error
+	err       error
 }
 
 func (c *writeCountFailConn) Write(p []byte) (int, error) {
@@ -36,7 +37,7 @@ func newWriteCountPair(t *testing.T, isServer bool) (*Conn, *Conn) {
 	t.Helper()
 	type result struct {
 		conn *Conn
-		err error
+		err  error
 	}
 	accepted := make(chan result, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -82,12 +83,12 @@ func newWriteCountPair(t *testing.T, isServer bool) (*Conn, *Conn) {
 func TestMessageWriterProgressOnFlushError(t *testing.T) {
 	const payload = "0123456789abcdefghijklmnopqrst"
 	tests := []struct {
-		name string
-		prefix string
-		data string
+		name              string
+		prefix            string
+		data              string
 		writesBeforeError int
-		wantCount int64
-		wantPayload string
+		wantCount         int64
+		wantPayload       string
 	}{
 		{"partial", "", payload, 1, 16, payload[:8]},
 		{"primed", "abc", payload, 1, 13, "abc" + payload[:5]},
@@ -123,7 +124,7 @@ func TestMessageWriterProgressOnFlushError(t *testing.T) {
 						count, err = io.WriteString(writer, tt.data)
 						n = int64(count)
 					case "Copy":
-						n, err = io.Copy(writer, strings.NewReader(tt.data))
+						n, err = io.Copy(writer, bytes.NewReader([]byte(tt.data)))
 					}
 					if n != tt.wantCount {
 						t.Errorf("%s count = %d, want %d bytes from this call", method, n, tt.wantCount)
